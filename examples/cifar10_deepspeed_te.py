@@ -1,12 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""The deepspeed cifar10 example using MS-AMP. It is adapted from official deepspeed example.
+"""The deepspeed cifar10 example using MS-AMP and TransformerEngine. It is adapted from official deepspeed example.
 
-The only change is add "from msamp import deepspeed" and remove moe related code.
+The model is adapted from VisionTransfomrer in timm and it uses te.TransformerLayer as encoder block.
 """
 
 import argparse
+from functools import partial
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,7 +15,13 @@ import torch
 import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 import torchvision.transforms as transforms
+import transformer_engine.pytorch as te
+from transformer_engine.common import recipe
+from timm.models.layers import trunc_normal_
+from timm.models.vision_transformer import PatchEmbed
+from timm.models.vision_transformer_hybrid import HybridEmbed
 
 from msamp import deepspeed
 
@@ -105,30 +112,161 @@ print(' '.join('%5s' % classes[labels[j]] for j in range(4)))
 args = add_argument()
 
 
-class Net(nn.Module):
-    """Define a Convolutional Neural Network."""
-    def __init__(self):
+class FP8Block(nn.Module):
+    """Transformer Block using TransformerEngine."""
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.,
+        attn_drop=0.,
+        drop_path=0.,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm
+    ):
         """Constructor."""
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
+        super().__init__()
+        assert dim % 16 == 0
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        init_method = partial(trunc_normal_, std=.02)
+        self.m = te.TransformerLayer(
+            dim,
+            mlp_hidden_dim,
+            num_heads,
+            hidden_dropout=drop,
+            attention_dropout=attn_drop,
+            self_attn_mask_type='padding',
+            layer_type='encoder',
+            init_method=init_method,
+            output_layer_init_method=init_method,
+            drop_path_rate=drop_path,
+            fuse_qkv_params=True,
+        )
 
     def forward(self, x):
         """Forward computation."""
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
+        _, batch_size, _ = x.shape
+        padding = batch_size % 16 > 0
+        if padding:
+            x = F.pad(x, (0, 0, 0, 16 - batch_size % 16))
+        out = self.m(x, attention_mask=None)
+        if padding:
+            out = out[:, :batch_size]
+        return out
+
+
+class FP8VisionTransformer(nn.Module):
+    """Vision Transformer using TransformerEngine."""
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        num_classes=1000,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.,
+        qkv_bias=False,
+        qk_scale=None,
+        drop_rate=0.,
+        attn_drop_rate=0.,
+        drop_path_rate=0.,
+        hybrid_backbone=None,
+        norm_layer=nn.LayerNorm,
+        use_checkpoint=False
+    ):
+        """Constructor."""
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_features = self.embed_dim = embed_dim    # num_features for consistency with other models
+
+        if hybrid_backbone is not None:
+            self.patch_embed = HybridEmbed(hybrid_backbone, img_size=img_size, in_chans=in_chans, embed_dim=embed_dim)
+        else:
+            self.patch_embed = PatchEmbed(
+                img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
+            )
+        num_patches = self.patch_embed.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]    # stochastic depth decay rule
+        self.blocks = nn.ModuleList(
+            [
+                FP8Block(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    qk_scale=qk_scale,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[i],
+                    norm_layer=norm_layer
+                ) for i in range(depth)
+            ]
+        )
+        self.norm = norm_layer(embed_dim)
+
+        # NOTE as per official impl, we could have a pre-logits representation dense layer + tanh here
+        # self.repr = nn.Linear(embed_dim, representation_size)
+        # self.repr_act = nn.Tanh()
+
+        # Classifier head
+        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        trunc_normal_(self.pos_embed, std=.02)
+        trunc_normal_(self.cls_token, std=.02)
+        self.apply(self._init_weights)
+
+        self.use_checkpoint = use_checkpoint
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        """Forward features."""
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)    # stole cls_tokens impl from Phil Wang, thanks
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        # x: (B, L C)
+
+        # (L, B, C)
+        x = x.transpose(0, 1).contiguous()
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x)
+            else:
+                x = blk(x)
+
+        x = self.norm(x)
+        return x[0]
+
+    def forward(self, x):
+        """Forward computation."""
+        x = self.forward_features(x)
+        x = self.head(x)
         return x
 
 
-net = Net()
+# net = timm.models.vision_transformer.VisionTransformer(32, 2, 3, 10, 32, 4, 2, 4)
+net = FP8VisionTransformer(32, 2, 3, 10, 32, 4, 2, 4)
 
 # Initialize DeepSpeed to use the following features
 # 1) Distributed model
@@ -158,6 +296,8 @@ criterion = nn.CrossEntropyLoss()
 # We simply have to loop over our data iterator, and feed the inputs to the
 # network and optimize.
 
+fp8_recipe = recipe.DelayedScaling(margin=0, interval=1, fp8_format=recipe.Format.HYBRID)
+
 for epoch in range(2):    # loop over the dataset multiple times
 
     running_loss = 0.0
@@ -166,7 +306,9 @@ for epoch in range(2):    # loop over the dataset multiple times
         inputs, labels = data[0].to(model_engine.local_rank), data[1].to(model_engine.local_rank)
         if fp16:
             inputs = inputs.half()
-        outputs = model_engine(inputs)
+
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            outputs = model_engine(inputs)
         loss = criterion(outputs, labels)
 
         model_engine.backward(loss)
@@ -227,7 +369,8 @@ with torch.no_grad():
         images, labels = data
         if fp16:
             images = images.half()
-        outputs = net(images.to(model_engine.local_rank))
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            outputs = net(images.to(model_engine.local_rank))
         _, predicted = torch.max(outputs.data, 1)
         total += labels.size(0)
         correct += (predicted == labels.to(model_engine.local_rank)).sum().item()
@@ -249,7 +392,8 @@ with torch.no_grad():
         images, labels = data
         if fp16:
             images = images.half()
-        outputs = net(images.to(model_engine.local_rank))
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            outputs = net(images.to(model_engine.local_rank))
         _, predicted = torch.max(outputs, 1)
         c = (predicted == labels.to(model_engine.local_rank)).squeeze()
         for i in range(4):

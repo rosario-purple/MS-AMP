@@ -1,7 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""The ddp mnist exampe using MS-AMP. It is adapted from https://github.com/pytorch/examples/blob/main/mnist/main.py."""
+"""The ddp mnist example using MS-AMP.
+
+It is adapted from https://github.com/pytorch/examples/blob/main/mnist/main.py.
+"""
 
 from __future__ import print_function
 import os
@@ -170,7 +173,9 @@ def main():
 
     if args.local_rank == 0:
         dataset1 = datasets.MNIST('./data', train=True, download=True, transform=transform)
-    torch.cuda.synchronize()
+
+    torch.distributed.barrier()
+
     if args.local_rank > 0:
         dataset1 = datasets.MNIST('./data', train=True, download=False, transform=transform)
 

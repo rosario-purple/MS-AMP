@@ -12,6 +12,7 @@ from deepspeed.runtime.engine import SparseTensor, ZERO_OPTIMIZATION, AMP, amp, 
                                      see_memory_usage, DummyOptim, DeepSpeedZeroOptimizer, DeepSpeedZeRoOffload, \
                                      PipelineModule, ZeroStageEnum
 from deepspeed.moe.utils import is_moe_param
+from deepspeed.accelerator import get_accelerator
 
 from msamp import initialize as msamp_initialize
 from msamp.common.dtype import Dtypes
@@ -32,21 +33,25 @@ def split_half_float_double_sparse(tensors):
     Returns:
         list: list of buckets, each bucket is a tuple of (dtype, list of tensors).
     """
-    supported_types = [
-        'torch.cuda.HalfTensor', 'torch.cuda.FloatTensor', 'torch.cuda.DoubleTensor', 'torch.cuda.BFloat16Tensor',
-        'msamp.common.tensor.tensor.ScalingTensor',
-        SparseTensor.type()
-    ]
+    supported_types = get_accelerator().supported_dtypes() + [torch.int8, torch.uint8]
 
     for t in tensors:
-        assert t.type() in supported_types, f'attempting to reduce an unsupported grad type: {t.type()}'
+        assert t.dtype in supported_types, f'attempting to reduce an unsupported grad type: {t.type()}'
 
-    buckets = []
+    sparse_tensor_buckets, dense_tensor_buckets = [], []
     for _, dtype in enumerate(supported_types):
-        bucket = [t for t in tensors if t.type() == dtype]
-        if bucket:
-            buckets.append((dtype, bucket))
-    return buckets
+        sparse_bucket, dense_bucket = [], []
+        for t in tensors:
+            if t.dtype == dtype:
+                if isinstance(t, SparseTensor):
+                    sparse_bucket.append(t)
+                else:
+                    dense_bucket.append(t)
+        if sparse_bucket:
+            sparse_tensor_buckets.append((dtype, sparse_bucket))
+        if dense_bucket:
+            dense_tensor_buckets.append((dtype, dense_bucket))
+    return sparse_tensor_buckets, dense_tensor_buckets
 
 
 deepspeed.runtime.engine.split_half_float_double_sparse = split_half_float_double_sparse
@@ -82,7 +87,8 @@ class MSAMPDeepSpeedEngine(DeepSpeedEngine):
             if optlevel == 'O3':
                 # O3 is for ZeRO and need to cast to O2 for MS-AMP.
                 optlevel = 'O2'
-            model, basic_optimizer = msamp_initialize(self.module, basic_optimizer, optlevel)
+            use_te = self.msamp_use_te()
+            model, basic_optimizer = msamp_initialize(self.module, basic_optimizer, optlevel, use_te)
             self._set_client_model(model)
             # We need to reset param names after msamp initialize.
             self.param_names = {param: name for name, param in model.named_parameters()}
@@ -232,7 +238,7 @@ class MSAMPDeepSpeedEngine(DeepSpeedEngine):
                 expert_data_parallel_group=self.expert_data_parallel_group if self.has_moe_layers else None,
                 reduce_scatter=self.zero_reduce_scatter(),
                 overlap_comm=overlap_comm,
-                cpu_offload=self.zero_cpu_offload(),
+                offload_optimizer_config=self.zero_offload_optimizer(),
                 mpu=self.mpu,
                 postscale_gradients=self.postscale_gradients(),
                 gradient_predivide_factor=self.gradient_predivide_factor(),
@@ -464,9 +470,13 @@ class MSAMPDeepSpeedEngine(DeepSpeedEngine):
             buf.copy_(synced)
 
     def msamp_enabled(self):
-        """Whether amp is enabled."""
+        """Whether msamp is enabled."""
         return self._config.msamp_enabled
 
     def msamp_optlevel(self):
         """Return the opt level of MS-AMP."""
         return self._config.msamp_optlevel
+
+    def msamp_use_te(self):
+        """Whether use transformer engine."""
+        return self._config.msamp_use_te
