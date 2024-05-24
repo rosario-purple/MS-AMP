@@ -7,7 +7,7 @@
 
 import torch
 import deepspeed
-from deepspeed.runtime.engine import SparseTensor, ZERO_OPTIMIZATION, AMP, amp, \
+from deepspeed.runtime.engine import SparseTensor, ZERO_OPTIMIZATION, AMP, \
                                      FP16, BFLOAT16, logger, DeepSpeedEngine, instrument_w_nvtx, log_dist, \
                                      see_memory_usage, DummyOptim, DeepSpeedZeroOptimizer, DeepSpeedZeRoOffload, \
                                      PipelineModule, ZeroStageEnum
@@ -105,12 +105,7 @@ class MSAMPDeepSpeedEngine(DeepSpeedEngine):
         elif optimizer_wrapper == FP8:
             self.optimizer = self._configure_fp8_optimizer(basic_optimizer, optimizer_wrapper)
         elif optimizer_wrapper == AMP:
-            amp_params = self.amp_params()
-            log_dist(f'Initializing AMP with these params: {amp_params}', ranks=[0])
-            model, self.optimizer = amp.initialize(self.module, basic_optimizer, **amp_params)
-            self._set_client_model(model)
-            self._broadcast_model()
-            # TODO: maybe need to broadcast experts differently?
+            raise ValueError("Sorry, AMP is obsolete")
         elif optimizer_wrapper == FP16:
             self.optimizer = self._configure_fp16_optimizer(basic_optimizer)
         elif optimizer_wrapper == BFLOAT16:
