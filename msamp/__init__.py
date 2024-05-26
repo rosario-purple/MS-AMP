@@ -14,7 +14,7 @@ from msamp.te import TeReplacer
 opt_levels = ['O1', 'O2']
 
 
-def initialize(model, optimizer=None, opt_level='O1', use_te=False):    # noqa: C901
+def initialize(model, optimizer=None, opt_level='O1', use_te=False, te_fp8_model_init=False):    # noqa: C901
     """Initialize your model, optimizer according to the optimization level.
 
     msamp.initialize() should be called after you have finished constructing your model and optimizer.
@@ -62,7 +62,7 @@ def initialize(model, optimizer=None, opt_level='O1', use_te=False):    # noqa: 
     if not use_te:
         cast_model = LinearReplacer.replace(model)
     else:
-        cast_model = TeReplacer.replace(model)
+        cast_model = TeReplacer.replace(model, te_fp8_model_init)
 
     parameters = list(cast_model.parameters())
 
