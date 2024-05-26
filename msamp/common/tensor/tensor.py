@@ -120,6 +120,28 @@ meta.dtype is {meta_dtype} (meta.qtype is {meta.qtype}).'
         """
         return self._backward_post_hooks.register_hook(fn)
 
+    @torch.no_grad()
+    def reset_fp8_meta_scale_inv(self) -> None:
+        """Replace FP8 meta tensor scale-inverse with cached value
+        
+        The FP8 meta tensor scale_inv entry corresponding to this
+        tensor is replaced with the scale_inv value used to construct
+        the tensor.
+
+        """
+        if not hasattr(self, "_fp8_meta") or self._fp8_meta is None:
+            return
+        fp8_meta_key = FP8GlobalStateManager.get_meta_tensor_key(
+            forward=self._fp8_meta_forward,
+        )
+        scale_inv = self._fp8_meta[fp8_meta_key].scale_inv[self._fp8_meta_index]
+        scale_inv.view(1).copy_(self._scale_inv.view(1))
+
+    def transpose(self, update_cache=None):
+        if not Dtypes.is_fp8_qtype(self.meta.qtype):
+            return self.t()
+        return self.fp8_transpose()
+        
     def backward_grad_update(self, grad):
         """Update backward grad.
 
@@ -220,6 +242,13 @@ meta.dtype is {meta_dtype} (meta.qtype is {meta.qtype}).'
             return TypeCast.cast_from_fp32
         raise TypeError(f'Unsupported Type: {self.meta.qtype}')
 
+    def dim(self):
+        return self.value.dim()
+
+    @property
+    def _data(self):
+        return self.value
+    
     def cast(self, qtype):
         """Cast the ScalingTensor by qtype.
 
